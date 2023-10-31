@@ -16,20 +16,17 @@ SERVICE_RATE_NORMAL = 1.0 / AVG_SERVICE_TIME_NORMAL
 SERVICE_RATE_PREORDER = 1.0 / AVG_SERVICE_TIME_PREORDER
 
 GATE_LENGTH = 3
-PRE_ORDER_QUEUE_LENGTH = 6
-NORMAL_QUEUE_LENGTH = 2
-
-NUM_BAR_TABLES = 3
-NUM_NORMAL_TABLES = 3
-NUM_PREORDER_TABLES = 3
+PRE_ORDER_QUEUE_LENGTH = 3
+NORMAL_QUEUE_LENGTH = 3
 
 # GATE_LENGTH = 10
 # PRE_ORDER_QUEUE_LENGTH = 15
 # NORMAL_QUEUE_LENGTH = 5
 
-# NUM_BAR_TABLES = 25
-# NUM_NORMAL_TABLES = 20
-# NUM_PREORDER_TABLES = 5
+NUM_BAR_TABLES = 3
+NUM_NORMAL_TABLES = 3
+NUM_PREORDER_TABLES = 3
+NUM_NORMAL_QUEUE = 3
 
 NORMAL_CUSTOMER_LESS_THAN_5 = 1 - m.exp(- SERVICE_RATE_NORMAL * 5)
 
@@ -96,7 +93,9 @@ class Queue:
     # mutator
     def push(self, customer: Customer):
         if self.is_full:
+            logger(customer, Action.Discard, self, env.now)
             return False
+        logger(customer, Action.Enter, self, env.now)
         self.customers.append(customer)
         return True
 
@@ -108,6 +107,7 @@ class Queue:
     def pop(self) -> Customer or None:
         if not self.is_empty:
             customer = self.customers.pop(0)
+            logger(customer, Action.Leave, self, env.now)
             return customer
         return None
 
@@ -159,6 +159,11 @@ class Server(simpy.Resource):
     def create_normal_server(cls):
         return cls(env, NUM_NORMAL_TABLES, 'NormalTables')
 
+    def serve(self, customer, service_time):
+        logger(customer, Action.Enter, self, env.now)
+        yield env.timeout(service_time)
+        logger(customer, Action.Leave, self, env.now)
+
 
 class Simulator:
     def __init__(self) -> None:
@@ -169,7 +174,7 @@ class Simulator:
         self.entry_queue = Queue.create_entry_queue()
         self.preorder_queue = Queue.create_preorder_queue()
         self.normal_queues = [
-            Queue.create_food_serve_queue() for i in range(3)
+            Queue.create_food_serve_queue() for i in range(NUM_NORMAL_QUEUE)
         ]
 
         self.discarded_by_entry_queue_customers = []
@@ -188,12 +193,9 @@ class Simulator:
         if not self.entry_queue.push(customer):
             # Queue fulled
             # Store discarded customer
-            print("currect queue: ", self.entry_queue.length)
-            logger(customer, Action.Discard, self.entry_queue, env.now)
             self.discarded_by_entry_queue_customers.append(customer)
             return
 
-        logger(customer, Action.Enter, self.entry_queue, env.now)
         # Customer start wait in entry queue
         customer.start_wait()
         self.delivery_customer()
@@ -213,23 +215,23 @@ class Simulator:
         with self.bar_area.request() as request:
             yield request
             customer = self.entry_queue.pop()
-            logger(customer, Action.Leave, self.entry_queue, env.now)
 
-            entry_wait_time = customer.end_wait()
-            customer.entry_queue_wait_time = entry_wait_time
+            customer.set_entry_queue_wait_time(customer.end_wait())
 
             # Serve customer in bar area
             service_time = get_random_service_time(SERVICE_RATE_BAR)
-            logger(customer, Action.Enter, self.bar_area, env.now)
-            yield env.timeout(service_time)
-            logger(customer, Action.Leave, self.bar_area, env.now)
+
+            yield from self.bar_area.serve(customer, service_time)
 
             if service_time <= 5.0:
                 # Customer with service time < 5 go to queue
-                logger(customer, Action.Enter, self.preorder_queue, env.now)
-                self.preorder_queue.push(customer)
+                if not self.preorder_queue.push(customer):
+                    self.discarded_by_preorder_queue_customer(customer)
+                    return
+
                 customer.start_wait()
                 env.process(self.serve_preorder_area_from_bar_area())
+
             else:
                 available_queue = None
                 for q in self.normal_queues:
@@ -237,9 +239,9 @@ class Simulator:
                         available_queue = q
                 if not available_queue:
                     logger(customer, Action.Discard, available_queue, env.now)
+                    self.discarded_by_normal_queue_customer.append(customer)
                     # Cusomter discarded
                     return
-                logger(customer, Action.Enter, available_queue, env.now)
                 available_queue.push(customer)
                 env.process(self.serve_normal_area(available_queue))
 
@@ -249,32 +251,39 @@ class Simulator:
             yield request
             customer = queue.pop()
             customer.normal_queue_wait_time = customer.end_wait()
-            logger(customer, Action.Leave, queue, env.now)
-            logger(customer, Action.Enter, self.normal_area, env.now)
-            yield env.timeout(get_random_service_time(SERVICE_RATE_NORMAL))
+            yield from self.normal_area.serve(
+                customer,
+                get_random_service_time(SERVICE_RATE_NORMAL)
+            )
+            # Store completed customers
+            self.compleded_customers.append(customer)
 
     # Done
     def serve_preorder_area_from_bar_area(self):
         with self.preorder_area.request() as request:
             yield request
             customer = self.preorder_queue.pop()
-            logger(customer, Action.Leave, self.preorder_queue, env.now)
             customer.preorder_queue_wait_time = customer.end_wait()
-            logger(customer, Action.Enter, self.preorder_area, env.now)
-            yield env.timeout(get_random_service_time(SERVICE_RATE_PREORDER))
-            logger(customer, Action.Leave, self.preorder_area, env.now)
+            yield from self.preorder_area.serve(
+                customer,
+                get_random_service_time(SERVICE_RATE_PREORDER)
+            )
+            # Store completed customers
+            self.compleded_customers.append(customer)
 
     # DONE
     def serve_preorder_area_from_entry_queue(self):
         with self.preorder_area.request() as request:
             yield request
             customer = self.entry_queue.pop()
-            logger(customer, Action.Leave, self.entry_queue, env.now)
-            customer.entry_queue_wait_time = customer.end_wait()
-            logger(customer, Action.Enter, self.preorder_area, env.now)
-            yield env.timeout(get_random_service_time(SERVICE_RATE_PREORDER))
-            logger(customer, Action.Finish, self.preorder_area, env.now)
+            customer.set_entry_queue_wait_time(customer.end_wait())
+
+            yield from self.preorder_area.serve(
+                customer,
+                get_random_service_time(SERVICE_RATE_PREORDER)
+            )
             # Store completed customers
+            self.compleded_customers.append(customer)
 
 
 def get_inter_arrival_time():
